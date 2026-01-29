@@ -10,7 +10,7 @@
 //
 //	{"loadBalancingPolicy": "preference_balancer", "loadBalancingConfig": [{"preference_balancer": {"preferredEndpoints": ["127.0.0.1:1234"]}}]}
 //
-// A service config can for example be given with [google.golang.org/grpc.WithDefaultServiceConfig].
+// A service config can for example be given with [google.golang.org/grpc.WithDefaultServiceConfig] (and enforced with [google.golang.org/grpc.WithDisableServiceConfig] to ignore the resolvers ServiceConfig).
 package preferencebalancer
 
 import (

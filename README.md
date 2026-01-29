@@ -10,6 +10,13 @@ Make sure to import this package, for example with:
 
 This balancer can be used with a service config like:
 
-	{"loadBalancingPolicy": "preference_balancer", "loadBalancingConfig": [{"preference_balancer": {"preferredEndpoints": ["127.0.0.1:1234"]}}]}
+	{
+		"loadBalancingPolicy": "preference_balancer",
+		"loadBalancingConfig": [
+			{"preference_balancer": {
+				"preferredEndpoints": ["127.0.0.1:1234"]}
+			}
+		]
+	}
 
-A service config can for example be given with [google.golang.org/grpc.WithDefaultServiceConfig] (and enforced with grpc.WithDisableServiceConfig to ignore the resolvers ServiceConfig).
+A service config can for example be given with [google.golang.org/grpc.WithDefaultServiceConfig](https://pkg.go.dev/google.golang.org/grpc#WithDefaultServiceConfig) (and enforced with [grpc.WithDisableServiceConfig](https://pkg.go.dev/google.golang.org/grpc#WithDisableServiceConfig) to ignore the resolvers ServiceConfig).
