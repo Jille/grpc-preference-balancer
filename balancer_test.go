@@ -59,10 +59,10 @@ func TestPreferenceBalancer(t *testing.T) {
 		}
 	}
 	if got := servers[0].hits.Load(); got != 0 {
-		t.Errorf("Server[1] got %d hits, wanted 0", got)
+		t.Errorf("Server[0] got %d hits, wanted 0", got)
 	}
 	if got := servers[1].hits.Load(); got != 100 {
-		t.Errorf("Server[0] got %d hits, wanted 100", got)
+		t.Errorf("Server[1] got %d hits, wanted 100", got)
 	}
 	if got := servers[2].hits.Load(); got != 0 {
 		t.Errorf("Server[2] got %d hits, wanted 0", got)
