@@ -15,11 +15,13 @@ package preferencebalancer
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Jille/errchain"
 	"github.com/Jille/genericz"
@@ -83,9 +85,14 @@ type preferenceBalancer struct {
 	// subconns itself is not thread-safe, but only written to from the balancer.Balancer interface methods which is guaranteed to be called from a single goroutine.
 	subconns *resolver.EndpointMap[*subconn]
 
-	// mtx guards preferredEndpoints, subconns.state and subconns.isPreferred
-	mtx                sync.Mutex
-	preferredEndpoints []string
+	// mtx guards everything below and all properties of subconn.
+	mtx                    sync.Mutex
+	preferredEndpoints     []string
+	resolverError          error
+	lastPreferredConnError error
+	lastConnError          error
+	connectingDeadline     time.Time
+	moreConnectionsTimer   *time.Timer
 }
 
 var _ balancer.Balancer = &preferenceBalancer{}
@@ -101,7 +108,7 @@ func (pb *preferenceBalancer) UpdateClientConnState(ccs balancer.ClientConnState
 	if err := pb.syncEndpoints(ccs); err != nil {
 		return err
 	}
-	pb.exitIdleLocked()
+	pb.updateStateLocked()
 	return nil
 }
 
@@ -127,14 +134,15 @@ func (pb *preferenceBalancer) syncEndpoints(ccs balancer.ClientConnState) error 
 		for _, e := range endpoints {
 			wanted.Set(e, struct{}{})
 		}
-		for _, e := range pb.subconns.Keys() {
+		for e, sc := range pb.subconns.All() {
 			if _, ok := wanted.Get(e); !ok {
-				pb.forgetEndpoint(e)
+				sc.sc.Shutdown()
+				pb.subconns.Delete(e)
 			}
 		}
 	}
-	for _, e := range pb.subconns.Keys() {
-		s, _ := pb.subconns.Get(e)
+
+	for e, s := range pb.subconns.All() {
 		s.isPreferred = false
 		for _, a := range e.Addresses {
 			if slices.Contains(pb.preferredEndpoints, a.Addr) {
@@ -159,59 +167,28 @@ func (pb *preferenceBalancer) addEndpoint(e resolver.Endpoint) error {
 	return nil
 }
 
-func (pb *preferenceBalancer) forgetEndpoint(e resolver.Endpoint) {
-	sc, _ := pb.subconns.Get(e)
-	sc.sc.Shutdown()
-	pb.subconns.Delete(e)
-}
-
 func (preferenceBalancer) UpdateSubConnState(sc balancer.SubConn, scs balancer.SubConnState) {
 	// This should never be called because we provide a StateListener.
 }
 
 func (pb *preferenceBalancer) ResolverError(err error) {
-	if pb.subconns.Len() == 0 {
-		pb.cc.UpdateState(balancer.State{
-			ConnectivityState: connectivity.TransientFailure,
-			Picker:            base.NewErrPicker(err),
-		})
-	}
-}
-
-func (pb *preferenceBalancer) ExitIdle() {
 	pb.mtx.Lock()
 	defer pb.mtx.Unlock()
-	pb.exitIdleLocked()
+	pb.resolverError = err
+	pb.updateStateLocked()
 }
 
-func (pb *preferenceBalancer) exitIdleLocked() {
-	fallback := true
-	for _, sc := range pb.subconns.Values() {
-		if sc.isPreferred {
-			switch sc.state {
-			case connectivity.Idle:
-				sc.sc.Connect()
-				fallback = false
-			case connectivity.Connecting, connectivity.Ready:
-				fallback = false
-			}
-		}
-	}
-	if fallback {
-		for _, sc := range pb.subconns.Values() {
-			if !sc.isPreferred && sc.state == connectivity.Idle {
-				sc.sc.Connect()
-			}
-		}
-	}
+// ExitIdle is a noop because we always want to be connected.
+func (pb *preferenceBalancer) ExitIdle() {
 }
 
 func (pb *preferenceBalancer) Close() {
+	pb.mtx.Lock()
+	defer pb.mtx.Unlock()
+	pb.clearConnectionDeadline()
 	for _, sc := range pb.subconns.Values() {
 		sc.sc.Shutdown()
 	}
-	// Break any future calls
-	pb.subconns = nil
 	pb.cc = nil
 }
 
@@ -220,21 +197,50 @@ type subconn struct {
 	sc balancer.SubConn
 
 	// Guarded by pb.mtx
-	state       connectivity.State
-	isPreferred bool
+	state                       connectivity.State
+	isPreferred                 bool
+	lastConnectionAttemptFailed bool
 }
 
 func (s *subconn) stateListener(scs balancer.SubConnState) {
 	s.pb.mtx.Lock()
 	defer s.pb.mtx.Unlock()
 	s.state = scs.ConnectivityState
+	switch scs.ConnectivityState {
+	case connectivity.Ready:
+		s.lastConnectionAttemptFailed = false
+	case connectivity.TransientFailure:
+		s.lastConnectionAttemptFailed = true
+		if s.isPreferred {
+			s.pb.lastPreferredConnError = scs.ConnectionError
+		}
+		s.pb.lastConnError = scs.ConnectionError
+	}
 	s.pb.updateStateLocked()
 }
 
 func (pb *preferenceBalancer) updateStateLocked() {
+	if pb.cc == nil {
+		// pb.Close() was called.
+		return
+	}
+	if pb.subconns.Len() == 0 {
+		if pb.resolverError != nil {
+			pb.cc.UpdateState(balancer.State{
+				ConnectivityState: connectivity.TransientFailure,
+				Picker:            base.NewErrPicker(pb.resolverError),
+			})
+		}
+		pb.cc.UpdateState(balancer.State{
+			ConnectivityState: connectivity.Connecting,
+			Picker:            base.NewErrPicker(balancer.ErrNoSubConnAvailable),
+		})
+		return
+	}
+	var hopefulConnectingAttempt bool
+	var anyPreferredConnecting bool
 	var preferredReady, othersReady int
-	var anyConnecting, anyIdle bool
-	for _, s := range pb.subconns.Values() {
+	for _, s := range pb.subconns.All() {
 		switch s.state {
 		case connectivity.Ready:
 			if s.isPreferred {
@@ -243,14 +249,50 @@ func (pb *preferenceBalancer) updateStateLocked() {
 				othersReady++
 			}
 		case connectivity.Connecting:
-			anyConnecting = true
+			if s.isPreferred {
+				anyPreferredConnecting = true
+			}
+			if !s.lastConnectionAttemptFailed {
+				hopefulConnectingAttempt = true
+			}
+		case connectivity.TransientFailure:
 		case connectivity.Idle:
-			anyIdle = true
+			if s.isPreferred {
+				s.sc.Connect()
+				anyPreferredConnecting = true
+				if !s.lastConnectionAttemptFailed {
+					hopefulConnectingAttempt = true
+				}
+				if pb.connectingDeadline.IsZero() {
+					pb.connectingDeadline = time.Now().Add(250 * time.Millisecond)
+					pb.moreConnectionsTimer = time.AfterFunc(250*time.Millisecond, pb.connectionTimerTrigger)
+				}
+			}
+		}
+	}
+	var connectToNonPreferred bool
+	if preferredReady == 0 && !hopefulConnectingAttempt {
+		connectToNonPreferred = true
+	}
+	if !anyPreferredConnecting {
+		pb.clearConnectionDeadline()
+	} else if preferredReady == 0 && !pb.connectingDeadline.IsZero() && time.Since(pb.connectingDeadline) >= 0 {
+		connectToNonPreferred = true
+		pb.clearConnectionDeadline()
+	}
+	if connectToNonPreferred {
+		for _, s := range pb.subconns.All() {
+			if !s.isPreferred && s.state == connectivity.Idle {
+				s.sc.Connect()
+				if !s.lastConnectionAttemptFailed {
+					hopefulConnectingAttempt = true
+				}
+			}
 		}
 	}
 	if preferredReady > 0 || othersReady > 0 {
 		chosen := make([]balancer.SubConn, 0, genericz.Ternary(preferredReady > 0, preferredReady, othersReady))
-		for _, s := range pb.subconns.Values() {
+		for _, s := range pb.subconns.All() {
 			if s.state == connectivity.Ready && (s.isPreferred || preferredReady == 0) {
 				chosen = append(chosen, s.sc)
 			}
@@ -263,17 +305,39 @@ func (pb *preferenceBalancer) updateStateLocked() {
 		})
 		return
 	}
-	st := balancer.State{
-		Picker: base.NewErrPicker(balancer.ErrNoSubConnAvailable),
-	}
-	if anyConnecting {
-		st.ConnectivityState = connectivity.Connecting
-	} else if anyIdle {
-		st.ConnectivityState = connectivity.Idle
+	if hopefulConnectingAttempt {
+		pb.cc.UpdateState(balancer.State{
+			ConnectivityState: connectivity.Connecting,
+			Picker:            base.NewErrPicker(balancer.ErrNoSubConnAvailable),
+		})
 	} else {
-		st.ConnectivityState = connectivity.TransientFailure
+		err := pb.lastPreferredConnError
+		if err == nil {
+			err = pb.lastConnError
+		}
+		if err == nil {
+			err = errors.New("balancer is not ready")
+		}
+		pb.cc.UpdateState(balancer.State{
+			ConnectivityState: connectivity.TransientFailure,
+			Picker:            base.NewErrPicker(err),
+		})
 	}
-	pb.cc.UpdateState(st)
+}
+
+func (pb *preferenceBalancer) connectionTimerTrigger() {
+	pb.mtx.Lock()
+	defer pb.mtx.Unlock()
+	pb.moreConnectionsTimer = nil
+	pb.updateStateLocked()
+}
+
+func (pb *preferenceBalancer) clearConnectionDeadline() {
+	pb.connectingDeadline = time.Time{}
+	if pb.moreConnectionsTimer != nil {
+		pb.moreConnectionsTimer.Stop()
+		pb.moreConnectionsTimer = nil
+	}
 }
 
 type picker struct {
