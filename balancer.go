@@ -230,6 +230,7 @@ func (pb *preferenceBalancer) updateStateLocked() {
 				ConnectivityState: connectivity.TransientFailure,
 				Picker:            base.NewErrPicker(pb.resolverError),
 			})
+			return
 		}
 		pb.cc.UpdateState(balancer.State{
 			ConnectivityState: connectivity.Connecting,
